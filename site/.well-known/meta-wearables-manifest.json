@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "name": "Glass Sentry",
+  "description": "Raiders hold real compass headings around you. Look to aim, lock on, pick the weapon and keep the shield up.",
+  "appearance": {
+    "theme_color": "#FF6B6B",
+    "icon": {
+      "src": "icon.png",
+      "type": "monochrome"
+    }
+  }
+}
