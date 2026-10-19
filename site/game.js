@@ -1,27 +1,26 @@
-'use strict';
-
-/* Glass Sentry — sky defence for Meta Ray-Ban Display glasses.
-   Raiders hold fixed compass headings around you. With head aiming on you
-   look at them to aim; otherwise swipes swing the sight from target to target.
+/* Glass Sentry — sky defence for Meta Ray-Ban Display glasses, in AR.
+   The real sky is the backdrop: the scene clears to black, which the glasses
+   show as see-through, and only the raiders (3D saucers, drone flocks and
+   carriers), incoming fire and blasts are drawn, at fixed compass headings.
+   A green vector HUD carries the compass arc, target brackets with range and
+   azimuth, the reticle, the shield and the weapon strip.
      Left / Right   swing to the next raider left / right (adds to head aim)
      Up             next weapon: Laser · Missile · Flak
-     Down           raise the shield for a moment (uses shield energy)
-     Pinch          fire
-     Down twice     pause
-   Laser hits instantly and suits drones; missiles need a lock and break
-   scouts and carriers; flak bursts where the sight is and clears flocks. */
+     Down           raise the shield for a moment; twice quickly to pause
+     Pinch          fire */
 
-const VERSION = '1.0.0';
-const { g, label, plate, banner, clamp, lerp, rand, beep, noise, head, store } = GK;
+import { THREE, makeRenderer, glowSprite, frameClock } from './kit3d.js';
+
+const VERSION = '2.0.0';
+const { g, label, clamp, lerp, rand, beep, noise, head, store } = GK;
 const D = Math.PI / 180;
-const F = 300 / Math.tan(32 * D);      // 64° wide view
 const WEAPONS = [
   { name: 'LASER', colour: '#7fffd4', reload: 0.18 },
   { name: 'MISSILE', colour: '#ffd34d', reload: 1.6 },
   { name: 'FLAK', colour: '#ff9f43', reload: 1.0 },
 ];
 
-let state = 'menu';      // menu | brief | play | pause | won | lost
+let state = 'title';     // title | aim-setup | menu | brief | play | pause | won | lost
 let raid, wave, waveT, foes, shots, blasts, view, weapon, reload, lock, lockT, hp, shield, shieldOn, score, time, msg, msgT, downAt = 0;
 let aimHead = store.get('sentry.head', false);
 let reached = store.get('sentry.reached', 1);
@@ -235,202 +234,304 @@ function end(r) {
   if (r === 'won') { beep(523, 0.2, 'triangle', 0.4); setTimeout(() => beep(784, 0.4, 'triangle', 0.4), 200); }
 }
 
-/* -------------------------------------------------------------- drawing */
+/* ------------------------------------------------------------------ scene */
 
-function toScreen(h, e, a) {
-  const dh = ((h - a.h + 540) % 360) - 180;
-  if (Math.abs(dh) > 80) return null;
-  return { x: 300 + Math.tan(dh * D) * F, y: 300 - Math.tan(clamp(e - a.e, -80, 80) * D) * F };
+// AR: the sky is the real world, so the scene clears to black (transparent on
+// the glasses) and only the raiders, shots and blasts are drawn, at their
+// compass headings. North is -z and east is +x.
+const renderer = makeRenderer(0x000000);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(64, 1, 0.5, 3000);
+camera.rotation.order = 'YXZ';
+const clock = frameClock();
+scene.add(new THREE.HemisphereLight(0xd8e4ff, 0x302020, 1.1));
+const keyL = new THREE.DirectionalLight(0xffffff, 1.2);
+keyL.position.set(100, 300, 100);
+scene.add(keyL);
+
+const dirOf = (h, e, r, out = new THREE.Vector3()) => out.set(Math.sin(h * D) * Math.cos(e * D) * r, Math.sin(e * D) * r, -Math.cos(h * D) * Math.cos(e * D) * r);
+const RANGE = { scout: 120, drone: 85, carrier: 420 };
+
+const std = (c, e = 0.2) => new THREE.MeshStandardMaterial({ color: c, metalness: 0.5, roughness: 0.35, emissive: c, emissiveIntensity: e });
+
+function scoutModel() {
+  // Saucer: a lathed disc with a glass dome and a ring of lights.
+  const gp = new THREE.Group();
+  const prof = [[0, -0.25], [0.6, -0.22], [1, -0.05], [1.02, 0], [0.9, 0.12], [0.45, 0.22], [0, 0.24]].map(([x, y]) => new THREE.Vector2(x, y));
+  gp.add(new THREE.Mesh(new THREE.LatheGeometry(prof, 28), std(0xb8c0d8, 0.15)));
+  const dome = new THREE.Mesh(new THREE.SphereGeometry(0.38, 18, 10, 0, Math.PI * 2, 0, Math.PI / 2), new THREE.MeshStandardMaterial({ color: 0x9be1ff, transparent: true, opacity: 0.7, emissive: 0x3a9adf, emissiveIntensity: 0.5 }));
+  dome.position.y = 0.2; gp.add(dome);
+  gp.lights = [];
+  for (let i = 0; i < 10; i++) {
+    const a = i / 10 * Math.PI * 2;
+    const l = new THREE.Mesh(new THREE.SphereGeometry(0.06, 6, 4), new THREE.MeshBasicMaterial({ color: 0xffd34d }));
+    l.position.set(Math.cos(a) * 0.92, 0.02, Math.sin(a) * 0.92); gp.add(l); gp.lights.push(l);
+  }
+  gp.add(glowSprite(0x9be15d, 3.2));
+  return gp;
+}
+function droneModel() {
+  const gp = new THREE.Group();
+  gp.add(new THREE.Mesh(new THREE.OctahedronGeometry(0.6, 0), std(0xff7ad0, 0.4)));
+  for (const s of [-1, 1]) { const w = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.06, 0.5), std(0xd04aa0, 0.3)); w.position.x = s * 0.9; w.rotation.z = s * 0.25; gp.add(w); }
+  gp.add(glowSprite(0xff7ad0, 2.2));
+  return gp;
+}
+function carrierModel() {
+  const gp = new THREE.Group();
+  const hull = new THREE.Mesh(new THREE.SphereGeometry(1, 32, 16), std(0x5a3a6a, 0.15)); hull.scale.set(1, 0.28, 0.55); gp.add(hull);
+  const ring = new THREE.Mesh(new THREE.TorusGeometry(0.95, 0.05, 8, 48), new THREE.MeshBasicMaterial({ color: 0xff5cc8 })); ring.rotation.x = Math.PI / 2; ring.scale.set(1, 0.58, 1); gp.add(ring);
+  const bridge = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.18, 0.2), std(0x8a6aa8)); bridge.position.y = 0.3; gp.add(bridge);
+  gp.lights = [];
+  for (let i = 0; i < 14; i++) { const l = new THREE.Mesh(new THREE.SphereGeometry(0.035, 6, 4), new THREE.MeshBasicMaterial({ color: 0xffffff })); l.position.set(-0.8 + i * 0.12, -0.1, 0.5); gp.add(l); gp.lights.push(l); }
+  return gp;
 }
 
-function drawWorld(a, now) {
-  // Stars fixed to the sky.
-  for (let i = 0; i < 160; i++) {
-    const h = (i * 137.508) % 360, e = 5 + ((i * 53.3) % 70);
-    const p = toScreen(h, e, a);
-    if (!p || p.y < 0 || p.y > 600) continue;
-    g.fillStyle = i % 9 === 0 ? '#fff' : '#6d7c96';
-    g.fillRect(p.x, p.y, i % 9 === 0 ? 2 : 1, i % 9 === 0 ? 2 : 1);
-  }
-  // Moon at a fixed heading.
-  const m = toScreen(130, 40, a);
-  if (m) { g.fillStyle = '#c9d4e6'; g.beginPath(); g.arc(m.x, m.y, 26, 0, Math.PI * 2); g.fill(); g.fillStyle = '#000'; g.beginPath(); g.arc(m.x + 10, m.y - 6, 22, 0, Math.PI * 2); g.fill(); }
-  // City skyline at the horizon, the same buildings at the same headings.
-  const hy = toScreen(a.h, 0, a).y;
-  g.fillStyle = '#0a0f17';
-  g.fillRect(0, hy, 600, 600);
-  for (let b = 0; b < 180; b++) {
-    const h = b * 2;
-    const p = toScreen(h, 0, a);
-    if (!p) continue;
-    const tall = 3 + ((b * 7919) % 13);
-    const top = toScreen(h, tall * 0.55, a);
-    const w = Math.tan(2 * D) * F + 1;
-    g.fillStyle = b % 3 ? '#0f1622' : '#141d2c';
-    g.fillRect(p.x - w / 2, top.y, w, hy - top.y + 1);
-    if ((b * 31) % 5 === 0) { g.fillStyle = '#ffd96b'; g.fillRect(p.x - 2, top.y + (hy - top.y) * 0.4, 3, 3); }
-  }
-  g.strokeStyle = '#3a5a80'; g.lineWidth = 1.5;
-  g.beginPath(); g.moveTo(0, hy); g.lineTo(600, hy); g.stroke();
+const foeMeshes = new Map();
+function meshFor(f) {
+  let m = foeMeshes.get(f);
+  if (m) return m;
+  m = f.kind === 'scout' ? scoutModel() : f.kind === 'drone' ? droneModel() : carrierModel();
+  scene.add(m);
+  foeMeshes.set(f, m);
+  return m;
 }
 
-function drawFoe(f, a, now) {
-  const p = toScreen(f.h, f.e, a);
-  if (!p) return;
-  const s = Math.tan(f.size * D) * F;
-  if (f.kind === 'scout') {
-    g.fillStyle = '#9be15d';
-    g.beginPath(); g.ellipse(p.x, p.y, s, s * 0.35, 0, 0, Math.PI * 2); g.fill();
-    g.fillStyle = '#d7ffb0';
-    g.beginPath(); g.ellipse(p.x, p.y - s * 0.25, s * 0.45, s * 0.35, 0, Math.PI, 0); g.fill();
-    for (let i = -2; i <= 2; i++) { g.fillStyle = Math.floor(now / 150 + i) % 2 ? '#ff5c5c' : '#ffd34d'; g.fillRect(p.x + i * s * 0.35 - 2, p.y - 1, 4, 3); }
-  } else if (f.kind === 'drone') {
-    g.fillStyle = '#ff9be0';
-    g.beginPath(); g.moveTo(p.x, p.y - s); g.lineTo(p.x + s, p.y); g.lineTo(p.x, p.y + s); g.lineTo(p.x - s, p.y); g.closePath(); g.fill();
-    g.fillStyle = '#fff'; g.fillRect(p.x - 1.5, p.y - 1.5, 3, 3);
-  } else if (f.kind === 'carrier') {
-    g.fillStyle = '#5a3a5c';
-    g.beginPath(); g.ellipse(p.x, p.y, s, s * 0.32, 0, 0, Math.PI * 2); g.fill();
-    g.fillStyle = '#8a5a8c'; g.fillRect(p.x - s * 0.6, p.y - s * 0.42, s * 1.2, s * 0.18);
-    for (let i = 0; i < 7; i++) { g.fillStyle = Math.floor(now / 300 + i) % 3 ? '#ff5cc8' : '#fff'; g.fillRect(p.x - s * 0.8 + i * s * 0.26, p.y + s * 0.12, 4, 4); }
-    // Health bar under the carrier.
-    g.fillStyle = 'rgba(255,255,255,.2)'; g.fillRect(p.x - 40, p.y + s * 0.4 + 8, 80, 5);
-    g.fillStyle = '#ff5cc8'; g.fillRect(p.x - 40, p.y + s * 0.4 + 8, 80 * f.hp / f.max, 5);
+// Pools for incoming shots, missiles and blasts.
+const pool = (make) => { const list = []; return (i) => { if (!list[i]) { list[i] = make(); scene.add(list[i]); } list[i].visible = true; return list[i]; }; };
+const shotList = [], blastList = [];
+const shotAt = pool(() => { const s = glowSprite(0xff7a4d, 3); shotList.push(s); return s; });
+const blastAt = pool(() => { const s = glowSprite(0xffd34d, 10); blastList.push(s); return s; });
+const beamGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3(0, 0, -1)]);
+const beam = new THREE.Line(beamGeo, new THREE.LineBasicMaterial({ color: 0x7fffd4 })); beam.frustumCulled = false; scene.add(beam);
+
+/* ---------------------------------------------------------------- render */
+
+const _v = new THREE.Vector3();
+let menuH = 0;
+
+function render3d(now) {
+  const dt = clock(now);
+  const a = view ? aimed() : { h: (menuH += dt * 6) % 360, e: 12 };
+  camera.rotation.y = -a.h * D;
+  camera.rotation.x = a.e * D;
+  const live = new Set();
+  if (foes) for (const f of foes) {
+    live.add(f);
+    const m = meshFor(f);
+    const r = RANGE[f.kind];
+    dirOf(f.h, f.e, r, m.position);
+    m.scale.setScalar(Math.tan(f.size * D) * r * (f.kind === 'carrier' ? 1 : 1.2));
+    m.rotation.y = -f.h * D + Math.sin(now / 700 + f.t) * 0.3;
+    m.rotation.z = Math.sin(now / 500 + f.t) * 0.15;
+    if (m.lights) m.lights.forEach((l, i) => l.material.color.setHex((Math.floor(now / 160) + i) % 2 ? 0xffd34d : 0xff5a5a));
   }
-}
-
-function render(now) {
-  g.fillStyle = '#000'; g.fillRect(0, 0, 600, 600);
-  if (!view) view = { h: 0, e: 12, off: 0 };
-  if (state === 'menu') view.h = (now / 100) % 360;
-  const a = aimed();
-  drawWorld(a, now);
-  if (state === 'menu') return GK.drawMenu(menu, now, 150);
-
-  for (const f of foes) drawFoe(f, a, now);
-  for (const s of shots) {
+  for (const [f, m] of foeMeshes) if (!live.has(f)) { scene.remove(m); foeMeshes.delete(f); }
+  let si = 0, bi = 0;
+  if (shots) for (const s of shots) {
+    const sp = shotAt(si++);
     if (s.kind === 'bolt') {
-      const p = toScreen(s.h, s.e * s.d, a);
-      if (!p) continue;
-      const r = (1 - s.d) * (s.big ? 40 : 22) + 3;
-      g.fillStyle = s.big ? 'rgba(255,92,200,.85)' : 'rgba(255,110,80,.85)';
-      g.beginPath(); g.arc(p.x, p.y + (1 - s.d) * 140, r, 0, Math.PI * 2); g.fill();
-      g.fillStyle = '#fff'; g.beginPath(); g.arc(p.x, p.y + (1 - s.d) * 140, r * 0.4, 0, Math.PI * 2); g.fill();
-    } else {
-      const p = toScreen(s.h, s.e, a);
-      if (p) { g.fillStyle = '#ffd34d'; g.beginPath(); g.arc(p.x, p.y, 4, 0, Math.PI * 2); g.fill(); }
-    }
+      // Incoming fire travels from the raider toward you and grows as it comes.
+      dirOf(s.h, s.e, 30 + 90 * s.d, sp.position);
+      sp.material.color.setHex(s.big ? 0xff5cc8 : 0xff7a4d);
+      sp.scale.setScalar((s.big ? 6 : 3.5) * (1.6 - s.d));
+    } else { dirOf(s.h, s.e, 70, sp.position); sp.material.color.setHex(0xffd34d); sp.scale.setScalar(3); }
   }
-  for (const b of blasts) {
-    const p = toScreen(b.h, b.e, a);
-    if (!p) continue;
+  shotList.slice(si).forEach((s) => (s.visible = false));
+  beam.visible = false;
+  if (blasts) for (const b of blasts) {
     if (b.beam) {
-      g.strokeStyle = b.c; g.lineWidth = 3; g.globalAlpha = b.t / 0.12;
-      g.beginPath(); g.moveTo(240, 600); g.lineTo(p.x, p.y); g.moveTo(360, 600); g.lineTo(p.x, p.y); g.stroke();
-      g.globalAlpha = 1;
-    } else {
-      g.globalAlpha = Math.min(1, b.t * 2);
-      g.strokeStyle = b.c; g.lineWidth = 4;
-      g.beginPath(); g.arc(p.x, p.y, Math.tan(b.r * D) * F * (1.2 - b.t), 0, Math.PI * 2); g.stroke();
-      g.globalAlpha = 1;
+      beam.visible = true;
+      beamGeo.setFromPoints([new THREE.Vector3().copy(camera.position).add(new THREE.Vector3(0, -6, 0).applyEuler(camera.rotation)), dirOf(b.h, b.e, 110, _v.clone())]);
+      continue;
     }
+    const sp = blastAt(bi++);
+    dirOf(b.h, b.e, 110, sp.position);
+    sp.material.color.set(b.c);
+    sp.scale.setScalar(Math.tan(b.r * D) * 110 * 2 * (1.3 - b.t));
+    sp.material.opacity = Math.min(1, b.t * 2);
   }
-  if (shieldOn > 0) {
-    g.strokeStyle = 'rgba(127,216,255,.55)'; g.lineWidth = 10;
-    g.beginPath(); g.arc(300, 900, 640, Math.PI * 1.15, Math.PI * 1.85); g.stroke();
-  }
-  hud(a, now);
-  if (state === 'brief') banner(now, raid.name.toUpperCase(), '#ff6b6b', 'Pinch to begin', [
-    aimHead ? 'Look at raiders to aim. Swipes swing the sight.' : 'Left / Right: swing to the next raider',
-    'Up: weapon  ·  Down: shield  ·  Pinch: fire',
-  ]);
-  if (state === 'pause') banner(now, 'PAUSED', '#fff', 'Pinch to continue', ['Left: back to the menu']);
-  if (state === 'won') banner(now, 'SKY CLEAR', '#9be15d', 'Pinch for the menu', ['Score ' + score + '  ·  hull ' + Math.max(0, Math.round(hp)) + '%']);
-  if (state === 'lost') banner(now, 'OVERRUN', '#ff6b6b', 'Pinch to retry', [raid.endless ? 'Reached wave ' + wave : 'Score ' + score, 'Down: back to the menu']);
+  blastList.slice(bi).forEach((s) => (s.visible = false));
+  renderer.render(scene, camera);
+}
+
+function screenOf(h, e) {
+  dirOf(h, e, 100, _v).project(camera);
+  if (_v.z > 1) return null;
+  return { x: (_v.x + 1) * 300, y: (1 - _v.y) * 300 };
+}
+
+/* -------------------------------------------------------------------- HUD */
+
+const GR = '#7cff9a', GRD = 'rgba(124,255,154,.45)';
+const mono = (size, w = 700) => `${w} ${size}px "SF Mono", Menlo, Consolas, monospace`;
+function mt(t, x, y, size, colour = GR, align = 'left', w = 700) { g.font = mono(size, w); g.textAlign = align; g.fillStyle = colour; g.fillText(t, x, y); }
+function frameBox(x, y, w, h, colour = GR) {
+  g.fillStyle = 'rgba(0,12,4,.55)'; g.fillRect(x, y, w, h);
+  g.strokeStyle = colour; g.lineWidth = 2; g.strokeRect(x, y, w, h);
+}
+function notchBox(x, y, w, h, colour = GR, fill = 'rgba(0,12,4,.6)') {
+  g.fillStyle = fill; g.beginPath(); g.moveTo(x, y); g.lineTo(x + w, y); g.lineTo(x + w, y + h - 10); g.lineTo(x + w - 10, y + h); g.lineTo(x, y + h); g.closePath(); g.fill();
+  g.strokeStyle = colour; g.lineWidth = 2; g.stroke();
 }
 
 function hud(a, now) {
-  const under = underSight(a);
-  // Sight.
-  const w = WEAPONS[weapon];
-  g.strokeStyle = under ? '#ff5c5c' : w.colour; g.lineWidth = 2;
-  g.beginPath(); g.arc(300, 300, weapon === 2 ? Math.tan(7 * D) * F : 16, 0, Math.PI * 2); g.stroke();
-  g.beginPath(); g.moveTo(300, 270); g.lineTo(300, 284); g.moveTo(300, 316); g.lineTo(300, 330); g.moveTo(270, 300); g.lineTo(284, 300); g.moveTo(316, 300); g.lineTo(330, 300); g.stroke();
-  if (weapon === 1 && lock && !lock.gone) {
-    const p = toScreen(lock.h, lock.e, a);
-    if (p) {
-      g.strokeStyle = lockT >= 0.6 ? '#ff3d3d' : '#ffd34d';
-      g.beginPath(); g.arc(p.x, p.y, 26, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * Math.min(1, lockT / 0.6)); g.stroke();
-      if (lockT >= 0.6 && GK.blink(now, 200)) label('LOCK', p.x, p.y + 44, 14, '#ff3d3d', 'center');
-    }
+  // Compass arc with headings, the current heading in a box.
+  g.strokeStyle = GR; g.lineWidth = 3; g.setLineDash([14, 8]);
+  g.beginPath(); g.arc(300, 330, 300, Math.PI * 1.28, Math.PI * 1.72); g.stroke(); g.setLineDash([]);
+  for (let d = -40; d <= 40; d += 5) {
+    const hh = Math.round(a.h / 5) * 5 + d, ang = Math.PI * 1.5 + (hh - a.h) * D * 1.1;
+    if (ang < Math.PI * 1.28 || ang > Math.PI * 1.72) continue;
+    const n = ((hh % 360) + 360) % 360;
+    const x = 300 + Math.cos(ang) * 300, y = 330 + Math.sin(ang) * 300;
+    const name = { 0: 'N', 45: 'NE', 90: 'E', 135: 'SE', 180: 'S', 225: 'SW', 270: 'W', 315: 'NW' }[n];
+    if (name) mt(name, x, y - 14, 15, name === 'N' ? '#ffffff' : GR, 'center');
   }
-  // Raiders off screen: arrows on the left or right edge, with how far round they are.
+  // Raiders off to the side: purple carets on the compass arc.
   for (const f of foes) {
     const r = rel(f, a);
-    if (Math.abs(r.dh) < 33) continue;
-    const x = r.dh > 0 ? 584 : 16;
-    const y = clamp(300 - r.de * 4, 90, 520);
-    g.fillStyle = f.kind === 'carrier' ? '#ff5cc8' : f.kind === 'scout' ? '#9be15d' : '#ff9be0';
-    g.beginPath();
-    if (r.dh > 0) { g.moveTo(x + 8, y); g.lineTo(x - 6, y - 7); g.lineTo(x - 6, y + 7); }
-    else { g.moveTo(x - 8, y); g.lineTo(x + 6, y - 7); g.lineTo(x + 6, y + 7); }
-    g.closePath(); g.fill();
+    if (Math.abs(r.dh) > 40) continue;
+    const ang = Math.PI * 1.5 + r.dh * D * 1.1, x = 300 + Math.cos(ang) * 300, y = 330 + Math.sin(ang) * 300;
+    g.fillStyle = f.kind === 'carrier' ? '#ff7ad0' : '#c8a8ff'; g.beginPath(); g.moveTo(x - 6, y + 4); g.lineTo(x + 6, y + 4); g.lineTo(x, y + 13); g.closePath(); g.fill();
   }
-  // Incoming fire warning on the edge it comes from.
+  g.fillStyle = GR; g.beginPath(); g.moveTo(300, 40); g.lineTo(294, 52); g.lineTo(306, 52); g.closePath(); g.fill();
+  frameBox(258, 60, 84, 34); mt(String(Math.round(a.h) % 360).padStart(3, '0'), 300, 85, 22, '#ffffff', 'center');
+  // Wave and score.
+  notchBox(18, 104, 150, 34); mt('WAVE', 30, 128, 16); g.fillStyle = GR; g.fillRect(88, 108, 2, 26); mt(wave + '/' + (raid.endless ? '∞' : raid.waves.length), 98, 128, 16, '#fff');
+  notchBox(432, 104, 150, 34); mt('SCORE', 444, 128, 16); g.fillRect(508, 108, 2, 26); mt(String(score).padStart(6, '0'), 576, 128, 16, '#fff', 'right');
+  // Target bracket with a leader line and label.
+  const under = underSight(a);
+  const tgt = under || (foes.length ? foes.reduce((b, f) => (Math.abs(rel(f, a).dh) < Math.abs(rel(b, a).dh) ? f : b)) : null);
+  if (tgt) {
+    const p = screenOf(tgt.h, tgt.e);
+    if (p && p.x > 0 && p.x < 600 && p.y > 0 && p.y < 600) {
+      const r = Math.max(20, Math.tan(tgt.size * D) * F2 * 1.4);
+      g.strokeStyle = weapon === 1 && lock === tgt && lockT >= 0.6 ? '#ff5a5a' : '#c8a8ff'; g.lineWidth = 2;
+      for (const [sx, sy] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) { g.beginPath(); g.moveTo(p.x + sx * r, p.y + sy * r * 0.5); g.lineTo(p.x + sx * r, p.y + sy * r); g.lineTo(p.x + sx * r * 0.5, p.y + sy * r); g.stroke(); }
+      g.beginPath(); g.moveTo(p.x + r, p.y + r); g.lineTo(p.x + r + 26, p.y + r + 24); g.lineTo(p.x + r + 70, p.y + r + 24); g.stroke();
+      const idx = foes.indexOf(tgt) + 1;
+      mt((tgt.kind === 'scout' ? 'S' : tgt.kind === 'drone' ? 'D' : 'C') + idx + ' ' + tgt.kind.toUpperCase(), p.x + r + 30, p.y + r + 18, 14, '#c8d0ff');
+      mt('R' + RANGE[tgt.kind] + ' A' + String(Math.round(((tgt.h % 360) + 360) % 360)).padStart(3, '0'), p.x + r + 30, p.y + r + 42, 14, '#c8d0ff');
+      if (weapon === 1 && lock === tgt && lockT > 0) { g.strokeStyle = lockT >= 0.6 ? '#ff5a5a' : '#ffd34d'; g.beginPath(); g.arc(p.x, p.y, r + 8, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * Math.min(1, lockT / 0.6)); g.stroke(); }
+    }
+  }
+  // Reticle: dashed ring, inner ring, small cross.
+  const w = WEAPONS[weapon];
+  g.strokeStyle = under ? '#ffffff' : GR; g.lineWidth = 4; g.setLineDash([10, 6]);
+  g.beginPath(); g.arc(300, 300, weapon === 2 ? Math.tan(7 * D) * F2 : 54, 0, Math.PI * 2); g.stroke(); g.setLineDash([]);
+  g.lineWidth = 1.5; g.beginPath(); g.arc(300, 300, 38, 0, Math.PI * 2); g.stroke();
+  g.beginPath(); g.moveTo(300, 262); g.lineTo(300, 278); g.moveTo(300, 322); g.lineTo(300, 338); g.moveTo(262, 300); g.lineTo(278, 300); g.moveTo(322, 300); g.lineTo(338, 300); g.stroke();
+  g.fillStyle = GR; g.fillRect(298, 298, 4, 4);
+  mt('SHD ' + Math.round(shield), 300, 392, 16, shieldOn > 0 ? '#ffffff' : GR, 'center');
+  // The gun barrel at the bottom and the horizon line.
+  g.strokeStyle = 'rgba(255,220,220,.9)'; g.lineWidth = 3; g.beginPath(); g.moveTo(300, 600); g.lineTo(300, 520); g.stroke();
+  g.fillStyle = '#ffffff'; g.beginPath(); g.arc(300, 518, 3, 0, Math.PI * 2); g.fill();
+  const hy = screenOf(a.h, 0);
+  if (hy && hy.y > 380 && hy.y < 600) { g.strokeStyle = GRD; g.lineWidth = 1.5; g.beginPath(); g.moveTo(30, hy.y); g.lineTo(570, hy.y); g.stroke(); for (let x = 60; x < 560; x += 80) g.fillRect(x, hy.y - 6, 1.5, 6); }
+  // Hull as a bar under the shield readout.
+  g.fillStyle = 'rgba(124,255,154,.2)'; g.fillRect(240, 400, 120, 5); g.fillStyle = hp > 35 ? GR : '#ff5a5a'; g.fillRect(240, 400, 120 * Math.max(0, hp) / 100, 5);
+  // Weapons strip and the shield button.
+  notchBox(20, 548, 116, 36, GR, shieldOn > 0 ? 'rgba(124,255,154,.35)' : 'rgba(0,12,4,.6)'); mt('SHIELD', 78, 572, 16, '#fff', 'center');
+  mt('‹', 196, 574, 22, GR, 'center'); mt('›', 576, 574, 22, GR, 'center');
+  WEAPONS.forEach((wp, i) => {
+    const x = 210 + i * 118, on = i === weapon;
+    notchBox(x, 548, 108, 36, on ? '#ffffff' : GRD, on ? 'rgba(124,255,154,.18)' : 'rgba(0,12,4,.6)');
+    mt(wp.name, x + 54, 572, 14, on ? '#fff' : GR, 'center');
+  });
+  g.fillStyle = GR; g.fillRect(210 + weapon * 118, 590, 108 * (1 - reload / w.reload), 4);
+  // Incoming fire from the side.
   for (const s of shots) {
     if (s.kind !== 'bolt' || s.d > 0.5) continue;
     const r = rel(s, a);
     if (Math.abs(r.dh) < 33) continue;
     g.fillStyle = GK.blink(now, 150) ? '#ff3d3d' : '#ffb35c';
-    g.fillRect(r.dh > 0 ? 588 : 0, 0, 12, 600);
+    g.fillRect(r.dh > 0 ? 588 : 0, 150, 12, 300);
   }
-  // Compass tape.
-  plate(150, 8, 300, 34, 10);
-  for (let d = -40; d <= 40; d += 5) {
-    const hh = Math.round(a.h / 5) * 5 + d;
-    const x = 300 + (hh - a.h) * 3.4;
-    if (x < 158 || x > 442) continue;
-    const n = ((hh % 360) + 360) % 360;
-    const name = { 0: 'N', 90: 'E', 180: 'S', 270: 'W' }[n];
-    g.fillStyle = '#a9adb3'; g.fillRect(x, 34, 1, n % 15 === 0 ? 6 : 3);
-    if (name) label(name, x, 29, 14, name === 'N' ? '#ff6b6b' : '#fff', 'center');
-    else if (n % 30 === 0) label(String(n), x, 28, 11, '#a9adb3', 'center', 600);
-  }
-  // Hull, shield, weapon.
-  plate(12, 520, 170, 66);
-  label('HULL', 24, 540, 12, '#a9adb3'); label('SHIELD', 24, 568, 12, '#a9adb3');
-  g.fillStyle = 'rgba(255,255,255,.15)'; g.fillRect(80, 532, 90, 8); g.fillRect(80, 560, 90, 8);
-  g.fillStyle = hp > 35 ? '#9be15d' : '#ff6b6b'; g.fillRect(80, 532, 90 * Math.max(0, hp) / 100, 8);
-  g.fillStyle = shieldOn > 0 ? '#ffffff' : '#7fd8ff'; g.fillRect(80, 560, 90 * shield / 100, 8);
-  plate(418, 520, 170, 66);
-  label(w.name, 576, 546, 20, w.colour, 'right');
-  g.fillStyle = 'rgba(255,255,255,.15)'; g.fillRect(430, 562, 146, 6);
-  g.fillStyle = w.colour; g.fillRect(430, 562, 146 * (1 - reload / w.reload), 6);
-  plate(12, 8, 120, 50); plate(468, 8, 120, 50);
-  label('WAVE ' + wave, 24, 40, 16, '#fff');
-  label(String(score), 576, 40, 18, '#ffd34d', 'right');
-  if (msgT > 0) label(msg, 300, 130, 26, msg === 'HIT' ? '#ff6b6b' : '#ffb35c', 'center');
-  if (aimHead && !GK.headLive() && GK.blink(now, 800)) label('Head aiming waiting — swipes still work', 300, 500, 14, '#ffb35c', 'center');
+  if (msgT > 0) mt(msg, 300, 220, 22, msg === 'HIT' ? '#ff6b6b' : '#ffd34d', 'center');
+  if (state === 'play' && time < 8) mt(aimHead ? 'LOOK AT A RAIDER, PINCH TO FIRE' : 'SWIPE LEFT OR RIGHT TO JUMP TO A TARGET', 300, 470, 15, '#ffffff', 'center');
+  if (aimHead && !GK.headLive() && GK.blink(now, 800)) mt('HEAD AIM WAITING · SWIPES WORK', 300, 440, 13, '#ffb35c', 'center');
+}
+const F2 = 300 / Math.tan(32 * D);
+
+function titleArc(text) {
+  g.strokeStyle = GR; g.lineWidth = 3; g.setLineDash([16, 8]);
+  g.beginPath(); g.arc(300, 330, 300, Math.PI * 1.3, Math.PI * 1.7); g.stroke(); g.setLineDash([]);
+  mt(text, 300, 58, 18, GR, 'center');
 }
 
-/* ----------------------------------------------------------------- menu */
+function setupScreen() {
+  titleArc('H E A D   T R A C K I N G');
+  mt('SENTRY AIMS WHERE YOU LOOK', 300, 110, 17, '#fff', 'center');
+  [['ENABLE HEAD TRACKING', 'PINCH TO ENABLE HEAD TRACKING'], ['AIM WITH SWIPES', 'SWIPE TO JUMP BETWEEN TARGETS']].forEach(([t1, t2], i) => {
+    const y = 160 + i * 96, on = i === setupI;
+    notchBox(on ? 70 : 80, y, on ? 460 : 440, 78, on ? '#ffffff' : GR);
+    if (on) { g.fillStyle = GR; g.fillRect(70, y, 6, 78); }
+    mt(t1, on ? 96 : 104, y + 36, 22, '#fff'); mt(t2, on ? 96 : 104, y + 62, 13, GR);
+  });
+  mt('YOU CAN CHANGE THIS IN SETTINGS', 300, 410, 15, GR, 'center');
+  mt('STAY AWARE OF YOUR SURROUNDINGS', 300, 448, 15, '#ffb070', 'center');
+  mt('SWIPE UP OR DOWN · PINCH TO CHOOSE', 300, 570, 14, GR, 'center');
+}
+let setupI = 0;
 
 const raidList = () => RAIDS.concat([ENDLESS]);
-const menu = GK.menu('GLASS SENTRY', '#ff6b6b', [
-  { text: () => { const r = raidList()[pick]; return 'Raid · ' + r.name + (pick + 1 > reached && !r.endless ? ' (locked)' : ''); },
-    hint: () => { const r = raidList()[pick]; const b = bests[r.name]; return (b ? (r.endless ? 'Best wave ' + b : 'Best ' + b) + ' · ' : '') + 'Left / Right: raid'; },
-    left: () => { pick = (pick + 3) % 4; }, right: () => { pick = (pick + 1) % 4; },
-    act: () => { const r = raidList()[pick]; if (r.endless || pick + 1 <= reached) start(r); else beep(200, 0.2); } },
-  { text: () => 'Aiming · ' + (aimHead ? 'Head' : 'Swipe'), hint: 'Head aiming asks for motion access once',
-    act: () => { aimHead = !aimHead; store.set('sentry.head', aimHead); if (aimHead) GK.askHead(); } },
-  { text: () => 'Invert head · ' + (head.invert ? 'on' : 'off'), act: () => GK.setInvert(!head.invert) },
-  { text: () => 'Sound · ' + (GK.sound.on ? 'on' : 'off'), act: () => GK.setSound(!GK.sound.on) },
-]);
+const MENU = () => [
+  { t: 'CAMPAIGN', s: () => { const r = raidList()[pick]; return r.name.toUpperCase() + ' ‹ › · ' + Math.min(reached - 1, 3) + ' OF 3 RAIDS CLEARED'; }, act: () => { const r = raidList()[pick]; if (r.endless || pick + 1 <= reached) start(r); else beep(200, 0.2); }, side: (d) => (pick = (pick + d + 4) % 4) },
+  { t: 'AIM', s: () => (aimHead ? 'HEAD TRACKING' : 'SWIPES'), act: () => { aimHead = !aimHead; store.set('sentry.head', aimHead); if (aimHead) GK.askHead(); }, side: () => {} },
+  { t: 'RE-CENTER', s: () => 'LOOK AHEAD, THEN PINCH', act: () => { GK.recentre(); beep(800, 0.1); }, side: () => {} },
+  { t: 'SOUND', s: () => (GK.sound.on ? 'ON' : 'OFF'), act: () => GK.setSound(!GK.sound.on), side: () => {} },
+];
+let menuI = 0;
+function menuScreen() {
+  titleArc('S E N T R Y');
+  MENU().forEach((it, i) => {
+    const y = 90 + i * 104, on = i === menuI;
+    notchBox(on ? 56 : 66, y, on ? 488 : 468, 86, on ? '#ffffff' : GR);
+    if (on) { g.fillStyle = GR; g.fillRect(56, y, 6, 86); }
+    mt(it.t, on ? 84 : 92, y + 40, 26, '#fff', 'left', 600);
+    mt(it.s(), on ? 84 : 92, y + 68, 13, GR);
+  });
+}
 
-/* ---------------------------------------------------------------- input */
+function panel(now, title, lines, prompt, colour = GR) {
+  notchBox(70, 180, 460, 120 + lines.length * 26, colour);
+  mt(title, 300, 228, 26, '#fff', 'center');
+  lines.forEach((t, i) => mt(t, 300, 264 + i * 26, 14, colour, 'center', 600));
+  if (GK.blink(now)) mt(prompt, 300, 264 + lines.length * 26 + 20, 15, '#fff', 'center');
+}
+
+function render(now) {
+  render3d(now);
+  g.clearRect(0, 0, 600, 600);
+  if (state === 'title') { titleArc('S E N T R Y'); mt('SKY DEFENCE', 300, 260, 40, '#fff', 'center', 800); mt('PINCH TO START', 300, 330, 18, GR, 'center'); return; }
+  if (state === 'aim-setup') return setupScreen();
+  if (state === 'menu') return menuScreen();
+  const a = aimed();
+  hud(a, now);
+  if (state === 'brief') panel(now, raid.name.toUpperCase(), [aimHead ? 'LOOK AT RAIDERS TO AIM' : 'LEFT / RIGHT: JUMP TO THE NEXT RAIDER', 'UP: WEAPON · DOWN: SHIELD · PINCH: FIRE'], 'PINCH TO BEGIN');
+  if (state === 'pause') panel(now, 'PAUSED', ['LEFT: BACK TO THE MENU'], 'PINCH TO CONTINUE');
+  if (state === 'won') panel(now, 'SKY CLEAR', ['SCORE ' + score + ' · HULL ' + Math.max(0, Math.round(hp)) + '%'], 'PINCH FOR THE MENU');
+  if (state === 'lost') panel(now, 'OVERRUN', [raid.endless ? 'REACHED WAVE ' + wave : 'SCORE ' + score, 'DOWN: BACK TO THE MENU'], 'PINCH TO RETRY', '#ff6b6b');
+}
+
+/* ------------------------------------------------------------------ input */
 
 GK.input.onKey = (k) => {
-  if (state === 'menu') { if (aimHead && head.state === 'off') GK.askHead(); return GK.menuKey(menu, k); }
+  if (state === 'title') { if (k === 'Enter') state = store.get('sentry.setup', false) ? 'menu' : 'aim-setup'; return; }
+  if (state === 'aim-setup') {
+    if (k === 'ArrowUp' || k === 'ArrowDown') setupI = 1 - setupI;
+    else if (k === 'Enter') { aimHead = setupI === 0; store.set('sentry.head', aimHead); store.set('sentry.setup', true); if (aimHead) GK.askHead(); state = 'menu'; }
+    return;
+  }
+  if (state === 'menu') {
+    const items = MENU();
+    if (k === 'ArrowUp') menuI = (menuI + items.length - 1) % items.length;
+    else if (k === 'ArrowDown') menuI = (menuI + 1) % items.length;
+    else if (k === 'ArrowLeft' || k === 'ArrowRight') items[menuI].side(k === 'ArrowLeft' ? -1 : 1);
+    else if (k === 'Enter') items[menuI].act();
+    beep(560, 0.03);
+    return;
+  }
   if (state === 'brief') { if (k === 'Enter') { state = 'play'; if (aimHead) { GK.recentre(); view.off = 0; } } else if (k === 'ArrowDown') state = 'menu'; return; }
   if (state === 'won') { if (k === 'Enter') state = 'menu'; return; }
   if (state === 'lost') { if (k === 'Enter') start(raid); else if (k === 'ArrowDown') state = 'menu'; return; }
@@ -449,3 +550,5 @@ GK.input.onKey = (k) => {
 
 GK.loop.onHidden = () => { if (state === 'play') state = 'pause'; };
 GK.run(tick, render);
+
+window.sentry = { get state() { return state; }, set state(x) { state = x; }, start, tick, fire, aimed, rel, RAIDS, ENDLESS, get foes() { return foes; }, get shots() { return shots; }, get view() { return view; }, set weapon(x) { weapon = x; }, get weapon() { return weapon; }, get reload() { return reload; }, get lockT() { return lockT; }, get shield() { return shield; }, get shieldOn() { return shieldOn; }, set shieldOn(x) { shieldOn = x; }, get hp() { return hp; }, get time() { return time; }, get wave() { return wave; }, set lock(x) { lock = x; } };
